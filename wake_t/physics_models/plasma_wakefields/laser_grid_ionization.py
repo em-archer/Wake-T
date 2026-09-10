@@ -6,12 +6,20 @@ import scipy.constants as ct
 
 from wake_t.fields.rz_wakefield import RZWakefield
 from wake_t.physics_models.laser.laser_pulse import LaserPulse
-from wake_t.utilities.numba import njit_serial
+from wake_t.utilities.numba import njit_parallel, prange
 from wake_t.utilities.other import ProfStart, ProfStop
 
+# Atomic units (SI)
+AU_ENERGY = ct.physical_constants["Hartree energy"][0]          # J
+AU_ENERGY_EV = AU_ENERGY / ct.e                                  # ~27.211 eV
+AU_TIME = ct.hbar / AU_ENERGY                                    # s
+AU_EFIELD = AU_ENERGY / (ct.e * ct.physical_constants[
+    "Bohr radius"][0])                                           # V/m
 
-@njit_serial
+
+@njit_parallel
 def do_grid_ionization(
+    model,
     num_ion_species,
     elec_density,
     ion_densities,
@@ -21,12 +29,14 @@ def do_grid_ionization(
     ion_atomic_number,
     ion_mass,
     omega0,
-    adk_prefactors,
+    prefactors,
     is_linear_pol,
     n_xi,
     n_r,
     d_zeta_inv,
 ):
+    dt = 1.0 / (d_zeta_inv * ct.c)
+
     for i_s in range(num_ion_species):
         ion_density = ion_densities[
             ion_start_index[i_s] : (ion_start_index[i_s] + ion_atomic_number[i_s] + 1),
@@ -37,8 +47,8 @@ def do_grid_ionization(
         is_last_plasma = i_s + 1 == num_ion_species
         max_ion_lev = ion_atomic_number[i_s]
 
-        for i_zeta in range(n_xi - 1, -1, -1):
-            for i_r in range(n_r):
+        for i_r in prange(n_r):
+            for i_zeta in range(n_xi - 1, -1, -1):
                 Et = 1j * a_env[i_zeta, i_r] * omega0
                 if i_zeta + 1 < n_xi:
                     Et += (
@@ -54,15 +64,46 @@ def do_grid_ionization(
                 for ion_lev in range(max_ion_lev):
                     p = 0
                     if Ep > 1e-30:
-                        w_dtau_dc = (
-                            adk_prefactors[i_s, ion_lev, 1]
-                            * np.pow(Ep, adk_prefactors[i_s, ion_lev, 0])
-                            * np.exp(adk_prefactors[i_s, ion_lev, 2] / Ep)
-                        )
+                        if model == "ADK":
+                            w_dtau_dc = (
+                                prefactors[i_s, ion_lev, 1]
+                                * np.pow(Ep, prefactors[i_s, ion_lev, 0])
+                                * np.exp(prefactors[i_s, ion_lev, 2] / Ep)
+                            )
 
-                        w_dtau_ac = w_dtau_dc
-                        if is_linear_pol:
-                            w_dtau_ac *= np.sqrt(Ep * adk_prefactors[i_s, ion_lev, 3])
+                            w_dtau_ac = w_dtau_dc
+                            if is_linear_pol:
+                                w_dtau_ac *= np.sqrt(Ep * prefactors[i_s, ion_lev, 3])
+
+                        elif model == "PPT":
+                            gamma = prefactors[i_s, ion_lev, 0] / Ep
+                            gamma2 = gamma * gamma
+                            sq = np.sqrt(1 + gamma2)
+                            beta = 2 * gamma / sq
+                            alpha = 2 * np.arcsinh(gamma) - beta
+
+                            kappa = prefactors[i_s, ion_lev, 1]
+                            v = kappa * (0.5 + 1.0 / (4 * gamma2))
+                            exponent = -2 * v * (
+                                np.arcsinh(gamma) - gamma * sq / (1 + 2 * gamma2)
+                            )
+                            s = (
+                                np.sqrt(np.pi) / (2 * (alpha + beta))
+                                * np.sqrt(beta / alpha)
+                            )
+                            
+                            w_dtau_dc = (
+                                prefactors[i_s, ion_lev, 3]
+                                * np.pow(beta, prefactors[i_s, ion_lev, 2])
+                                * (gamma2 / (1 + gamma2))
+                                * np.exp(exponent)
+                                * s
+                                * np.sqrt(np.pi * kappa * gamma / 3)
+                            )
+                            w_dtau_ac = w_dtau_dc
+                            if is_linear_pol:
+                                w_dtau_ac *= np.sqrt(3 / (np.pi * kappa * gamma))
+                            w_dtau_ac *= dt
 
                         p = 1 - np.exp(-w_dtau_ac)
 
@@ -128,6 +169,8 @@ class LaserGridIonization(RZWakefield):
         Number of grid elements along r to calculate the laser.
     n_xi : int
         Number of grid elements along xi to calculate the laser.
+    model : str
+        The ionisation model to use, either ``ADK`` or ``PPT``
     dz_fields : float, optional
         Determines how often the laser and plasma refractive index should
         be updated. If dz_fields=0 (default value), the laser is calculated
@@ -202,6 +245,7 @@ class LaserGridIonization(RZWakefield):
         xi_max: float,
         n_r: int,
         n_xi: int,
+        model: str,
         dz_fields: Optional[float] = None,
         species_rho_diags: Optional[bool] = False,
         r_max_plasma: Optional[float] = None,
@@ -233,6 +277,11 @@ class LaserGridIonization(RZWakefield):
             field_diags=field_diags,
             model_name="laser_in_vacuum",
         )
+        self.model = model
+        assert self.model in ("ADK", "PPT"), (
+            f"model must be 'ADK' or 'PPT', got {self.model!r}"
+        )
+        
         self.r_max_plasma = r_max_plasma
 
         ion_species_lookup = {
@@ -334,9 +383,12 @@ class LaserGridIonization(RZWakefield):
             [len(species["ionization_energy_eV"]) for species in self.ion_species]
         )
 
-        self.adk_prefactors = np.zeros(
+        self.prefactors = np.zeros(
             (len(self.ion_atomic_number), np.max(self.ion_atomic_number), 4)
         )
+
+        if self.model == "PPT":
+            self._ppt_prefactors_ready = False
 
         for i, species in enumerate(self.ion_species):
             wa = (
@@ -362,20 +414,30 @@ class LaserGridIonization(RZWakefield):
                 C2 = np.pow(2, 2 * n_eff) / (
                     n_eff * math.gamma(n_eff + l_eff + 1.0) * math.gamma(n_eff - l_eff)
                 )
-                self.adk_prefactors[i, j, 0] = -(2.0 * n_eff - 1.0)
-                self.adk_prefactors[i, j, 1] = (
-                    dt
-                    * wa
-                    * C2
-                    * (Uion / (2.0 * UH))
-                    * np.pow(2 * np.pow(Uion / UH, 3.0 / 2.0) * Ea, 2 * n_eff - 1)
-                )
-                self.adk_prefactors[i, j, 2] = (
-                    -2.0 / 3.0 * np.pow(Uion / UH, 3.0 / 2.0) * Ea
-                )
-                self.adk_prefactors[i, j, 3] = (
-                    (3.0 / ct.pi) * np.pow(Uion / UH, -3.0 / 2.0) / Ea
-                )
+                # Note: different factors calculated for ADK and PPT
+                if model == "ADK":
+                    self.prefactors[i, j, 0] = -(2.0 * n_eff - 1.0)
+                    self.prefactors[i, j, 1] = (
+                        dt
+                        * wa
+                        * C2
+                        * (Uion / (2.0 * UH))
+                        * np.pow(2 * np.pow(Uion / UH, 3.0 / 2.0) * Ea, 2 * n_eff - 1)
+                    )
+                    self.prefactors[i, j, 2] = (
+                        -2.0 / 3.0 * np.pow(Uion / UH, 3.0 / 2.0) * Ea
+                    )
+                    self.prefactors[i, j, 3] = (
+                        (3.0 / ct.pi) * np.pow(Uion / UH, -3.0 / 2.0) / Ea
+                    )
+                elif model == "PPT":
+                    # PPT's prefactors require omega0 which isn't necessarily known yet.
+                    # Stash omega0-independent quantum-defect numbers (Ip_au, n_eff, Cnl2).
+                    # Finish self.prefactors the first time _calculate_wakefield runs.
+                    Ip_au = Uion / AU_ENERGY_EV
+                    self.prefactors[i, j, 0] = Ip_au
+                    self.prefactors[i, j, 1] = n_eff
+                    self.prefactors[i, j, 2] = C2
 
         self.ion_start_index = (
             np.cumsum(self.ion_atomic_number + 1) - self.ion_atomic_number - 1
@@ -384,6 +446,49 @@ class LaserGridIonization(RZWakefield):
             (np.sum(self.ion_atomic_number + 1), self.n_xi + 4, self.n_r + 4)
         )
         self.elec_density = np.zeros((self.n_xi + 4, self.n_r + 4))
+
+    def _build_ppt_prefactors(self, omega0):
+        """
+        Fill self.prefactors for the PPT model, given the (now known)
+        laser angular frequency omega0.
+
+        PPT's field-dependence enters through the Keldysh parameter
+        gamma = omega0*sqrt(2*Ip)/E (dimensionless), with this term
+        appearing in arcsinh(gamma), sqrt(1+gamma**2), and a ponderomotive
+        shift Up = Ip/(2*gamma**2), which is itself within an exponent. 
+        
+        ADK is exactly the gamma -> 0 limit of PPT, where all terms simplify
+        to the ADK power law/exponential. PPT cannot be simplified so neatly;
+        instead we pull out every gamma-independent term (see constants below)
+        and use these alongside each evaluation of gamma in do_grid_ionization.
+
+            gamma   = K_gamma / Ep
+            kappa   = 2*Ip_au / omega0_au
+            ns_exp  = 2*n_eff - 1.5
+            C_level = 4*sqrt(2)/pi * Cnl2 * kappa**ns_exp * Ip_au / AU_TIME
+
+        Are the prefactors for PPT in this case.
+        """
+        omega0_au = omega0 * AU_TIME
+        n_species, n_lev = self.prefactors.shape[:2]
+        for i in range(n_species):
+            for j in range(n_lev):
+                Ip_au = self.prefactors[i, j, 0]
+                n_eff = self.prefactors[i, j, 1]
+                Cnl2  = self.prefactors[i, j, 2]
+                if Ip_au == 0.0:
+                    continue  # unused slot (species with fewer levels)
+                kappa = 2 * Ip_au / omega0_au
+                ns_exp = 2 * n_eff - 1.5
+                K_gamma = omega0_au * np.sqrt(2 * Ip_au) * AU_EFIELD
+                C_level = (
+                    4 * np.sqrt(2) / np.pi * Cnl2 * kappa**ns_exp * Ip_au / AU_TIME
+                )
+                self.prefactors[i, j, 0] = K_gamma
+                self.prefactors[i, j, 1] = kappa
+                self.prefactors[i, j, 2] = ns_exp
+                self.prefactors[i, j, 3] = C_level
+        self._ppt_prefactors_ready = True
 
     def _calculate_wakefield(self, bunches):
 
@@ -398,6 +503,11 @@ class LaserGridIonization(RZWakefield):
         # Get laser envelope
         a_env = self.laser.get_envelope()
         is_linear_pol = self.laser.polarization == "linear"
+
+        if self.model == "PPT":
+            if not self._ppt_prefactors_ready:
+                omega0 = 2 * ct.pi * ct.c / self.laser.l_0
+                self._build_ppt_prefactors(omega0)
 
         density_elec = self.density_function(self.t * ct.c, self.r_fld)
         if self.r_max_plasma is not None:
@@ -421,6 +531,7 @@ class LaserGridIonization(RZWakefield):
         elec_density = self.elec_density[2:-1, 2:-2]
 
         do_grid_ionization(
+            self.model,
             len(self.ion_species),
             elec_density,
             self.ion_densities,
@@ -430,7 +541,7 @@ class LaserGridIonization(RZWakefield):
             self.ion_atomic_number,
             self.ion_mass,
             omega0,
-            self.adk_prefactors,
+            self.prefactors,
             is_linear_pol,
             self.n_xi,
             self.n_r,
