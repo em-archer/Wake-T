@@ -52,6 +52,11 @@ class LaserPulse:
         self.a_env = None
         self.solver_params = None
         self.n_steps = 0
+        self.kerr = None
+
+    def set_kerr(self, kerr) -> None:
+        """Include the optical Kerr effect of a neutral gas (see `KerrGas`)."""
+        self.kerr = kerr
 
     def __add__(self, pulse_2):
         """Overload the add operator to allow summing of laser pulses."""
@@ -189,6 +194,13 @@ class LaserPulse:
         # If needed, interpolate chi to subgrid.
         if self.use_subgrid:
             chi = self._interpolate_chi_to_subgrid(chi)
+
+        # Add the Kerr susceptibility of the gas (computed on the solver grid
+        # from the current envelope; new array, so the plasma chi is untouched).
+        if self.kerr is not None:
+            chi = chi + self.kerr.chi(
+                self._a_env[:-2], k_0, k_p, polarization=self.polarization
+            )
 
         ProfStart("laser.evolve_envelope")
 
